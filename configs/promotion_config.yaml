@@ -1,0 +1,63 @@
+# Promotion Configuration
+# ======================
+
+# Model Registry
+registry_path: "models/registry"
+
+# Production Check
+production:
+  require_approval: true
+  required_approvers:
+    - "ml-team-lead"
+    - "data-science-lead"
+  min_test_coverage: 0.80
+  require_staging_deployment: true
+
+# Canary Deployment
+canary:
+  enabled: true
+  default_traffic_percent: 10
+  default_duration_minutes: 30
+  max_duration_minutes: 60
+  
+  thresholds:
+    max_error_rate: 0.05
+    max_latency_ms: 200
+    min_throughput_rps: 50
+    max_memory_usage_mb: 2000
+  
+  rollback:
+    auto_rollback: true
+    rollback_on_error_rate: 0.10
+    rollback_on_latency_ms: 500
+
+# Backup Configuration
+backup:
+  enabled: true
+  backup_path: "models/backup/"
+  retention_days: 90
+  max_backups: 10
+
+# Notification
+notifications:
+  enabled: true
+  channels:
+    - type: "slack"
+      webhook_url: null
+      channel: "#ml-deployments"
+    - type: "email"
+      recipients:
+        - "ml-team@company.com"
+  
+  events:
+    - "promotion_success"
+    - "promotion_failure"
+    - "rollback"
+    - "canary_complete"
+
+# Rollback Configuration
+rollback:
+  enabled: true
+  auto_rollback_on_failure: true
+  max_rollback_attempts: 3
+  cooldown_minutes: 5

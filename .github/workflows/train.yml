@@ -1,0 +1,169 @@
+name: Train Model
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'data/**'
+      - 'src/training/**'
+      - 'configs/**'
+  workflow_dispatch:
+    inputs:
+      force_retrain:
+        description: 'Force retrain even without data changes'
+        required: false
+        default: 'false'
+      model_type:
+        description: 'Model type to train'
+        required: false
+        default: 'classifier'
+
+env:
+  PYTHON_VERSION: '3.9'
+  MLFLOW_TRACKING_URI: ${{ secrets.MLFLOW_TRACKING_URI }}
+  DVC_REMOTE: ${{ secrets.DVC_REMOTE }}
+
+jobs:
+  check-data-changes:
+    runs-on: ubuntu-latest
+    outputs:
+      data_changed: ${{ steps.check.outputs.changed }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Check for data changes
+        id: check
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ] && [ "${{ github.event.inputs.force_retrain }}" = "true" ]; then
+            echo "changed=true" >> $GITHUB_OUTPUT
+          else
+            CHANGED_FILES=$(git diff --name-only HEAD~1 HEAD 2>/dev/null || echo "")
+            if echo "$CHANGED_FILES" | grep -q "^data/"; then
+              echo "changed=true" >> $GITHUB_OUTPUT
+            else
+              echo "changed=false" >> $GITHUB_OUTPUT
+            fi
+          fi
+
+  train:
+    needs: check-data-changes
+    if: needs.check-data-changes.outputs.data_changed == 'true' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    outputs:
+      model_version: ${{ steps.train.outputs.version }}
+      model_metrics: ${{ steps.train.outputs.metrics }}
+      model_path: ${{ steps.train.outputs.model_path }}
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Configure DVC
+        run: |
+          dvc remote modify --local origin url ${{ secrets.DVC_REMOTE_URL }}
+          dvc pull
+
+      - name: Get data hash
+        id: data_hash
+        run: |
+          DATA_HASH=$(find data/ -type f -exec md5sum {} \; | sort | md5sum | cut -d' ' -f1)
+          echo "hash=$DATA_HASH" >> $GITHUB_OUTPUT
+
+      - name: Check if model already exists
+        id: check_model
+        run: |
+          MODEL_VERSION="${{ steps.data_hash.outputs.hash }}"
+          if [ -f "models/${MODEL_VERSION}/model.pkl" ]; then
+            echo "exists=true" >> $GITHUB_OUTPUT
+          else
+            echo "exists=false" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Train model
+        id: train
+        if: steps.check_model.outputs.exists == 'false'
+        run: |
+          MODEL_TYPE="${{ github.event.inputs.model_type || 'classifier' }}"
+          python -m src.training.train \
+            --config configs/training_config.yaml \
+            --model-type $MODEL_TYPE \
+            --output-dir models/${{ steps.data_hash.outputs.hash }}
+          
+          echo "version=${{ steps.data_hash.outputs.hash }}" >> $GITHUB_OUTPUT
+          echo "model_path=models/${{ steps.data_hash.outputs.hash }}" >> $GITHUB_OUTPUT
+          
+          if [ -f "models/${{ steps.data_hash.outputs.hash }}/metrics.json" ]; then
+            METRICS=$(cat models/${{ steps.data_hash.outputs.hash }}/metrics.json)
+            echo "metrics=$METRICS" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Upload model artifacts
+        uses: actions/upload-artifact@v4
+        if: steps.check_model.outputs.exists == 'false'
+        with:
+          name: model-${{ steps.data_hash.outputs.hash }}
+          path: models/${{ steps.data_hash.outputs.hash }}/
+          retention-days: 30
+
+      - name: Push model to DVC
+        if: steps.check_model.outputs.exists == 'false'
+        run: |
+          dvc add models/${{ steps.data_hash.outputs.hash }}/model.pkl
+          git add models/${{ steps.data_hash.outputs.hash }}/model.pkl.dvc
+          git config user.email "ci@pipeline.com"
+          git config user.name "CI Pipeline"
+          git commit -m "chore: add model ${{ steps.data_hash.outputs.hash }}" || true
+          dvc push
+
+      - name: Log to MLflow
+        if: steps.check_model.outputs.exists == 'false'
+        env:
+          MLFLOW_TRACKING_URI: ${{ secrets.MLFLOW_TRACKING_URI }}
+        run: |
+          python -c "
+          import mlflow
+          import json
+          mlflow.set_tracking_uri('${{ env.MLFLOW_TRACKING_URI }}')
+          with mlflow.start_run(run_name='ci-train-${{ steps.data_hash.outputs.hash }}'):
+              mlflow.log_param('model_version', '${{ steps.data_hash.outputs.hash }}')
+              mlflow.log_param('model_type', '${{ github.event.inputs.model_type || 'classifier' }}')
+              mlflow.log_param('data_hash', '${{ steps.data_hash.outputs.hash }}')
+              try:
+                  metrics = json.loads('${{ steps.train.outputs.metrics }}')
+                  mlflow.log_metrics(metrics)
+              except:
+                  pass
+          "
+
+  notify-success:
+    needs: train
+    if: success() && needs.train.outputs.model_version != ''
+    runs-on: ubuntu-latest
+    steps:
+      - name: Notify training success
+        run: |
+          echo "Model trained successfully: ${{ needs.train.outputs.model_version }}"
+          echo "Triggering validation pipeline..."
+
+  notify-failure:
+    needs: train
+    if: failure()
+    runs-on: ubuntu-latest
+    steps:
+      - name: Notify training failure
+        run: |
+          echo "Training pipeline failed!"
+          echo "Please check the logs for details."

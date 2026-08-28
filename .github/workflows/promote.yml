@@ -1,0 +1,258 @@
+name: Promote to Production
+
+on:
+  repository_dispatch:
+    types: [promote-model]
+  workflow_dispatch:
+    inputs:
+      model_version:
+        description: 'Model version to promote'
+        required: true
+      approval_required:
+        description: 'Require manual approval'
+        required: false
+        default: 'true'
+
+env:
+  PYTHON_VERSION: '3.9'
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository }}
+
+jobs:
+  get-model-version:
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.version.outputs.value }}
+    steps:
+      - name: Get model version
+        id: version
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            echo "value=${{ github.event.inputs.model_version }}" >> $GITHUB_OUTPUT
+          else
+            echo "value=${{ github.client_payload.version }}" >> $GITHUB_OUTPUT
+          fi
+
+  approval-gate:
+    needs: get-model-version
+    if: github.event.inputs.approval_required == 'true' || github.event_name == 'repository_dispatch'
+    runs-on: ubuntu-latest
+    environment: production
+    steps:
+      - name: Manual approval required
+        run: |
+          echo "Model ${{ needs.get-model-version.outputs.version }} pending approval"
+          echo "Approve in GitHub environment settings to proceed"
+
+  validate-production-readiness:
+    needs: [get-model-version, approval-gate]
+    runs-on: ubuntu-latest
+    outputs:
+      ready: ${{ steps.validate.outputs.ready }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Download model
+        uses: actions/download-artifact@v4
+        with:
+          name: model-${{ needs.get-model-version.outputs.version }}
+          path: models/${{ needs.get-model-version.outputs.version }}/
+
+      - name: Final production validation
+        id: validate
+        run: |
+          python -m src.promotion.production_check \
+            --config configs/promotion_config.yaml \
+            --model-path models/${{ needs.get-model-version.outputs.version }}/model.pkl \
+            --version ${{ needs.get-model-version.outputs.version }}
+          
+          if [ $? -eq 0 ]; then
+            echo "ready=true" >> $GITHUB_OUTPUT
+          else
+            echo "ready=false" >> $GITHUB_OUTPUT
+          fi
+
+  backup-current-production:
+    needs: [get-model-version, validate-production-readiness]
+    if: needs.validate-production-readiness.outputs.ready == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Backup current production model
+        run: |
+          python -m src.promotion.backup \
+            --config configs/promotion_config.yaml \
+            --output-dir models/backup/
+
+      - name: Upload backup
+        uses: actions/upload-artifact@v4
+        with:
+          name: production-backup-${{ needs.get-model-version.outputs.version }}
+          path: models/backup/
+          retention-days: 90
+
+  deploy-canary:
+    needs: [get-model-version, validate-production-readiness, backup-current-production]
+    if: needs.validate-production-readiness.outputs.ready == 'true'
+    runs-on: ubuntu-latest
+    outputs:
+      canary_passed: ${{ steps.canary.outputs.passed }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Download model
+        uses: actions/download-artifact@v4
+        with:
+          name: model-${{ needs.get-model-version.outputs.version }}
+          path: models/${{ needs.get-model-version.outputs.version }}/
+
+      - name: Deploy canary
+        id: canary
+        run: |
+          python -m src.promotion.canary_deploy \
+            --config configs/promotion_config.yaml \
+            --model-path models/${{ needs.get-model-version.outputs.version }}/model.pkl \
+            --version ${{ needs.get-model-version.outputs.version }} \
+            --traffic-percent 10 \
+            --duration-minutes 30
+          
+          if [ $? -eq 0 ]; then
+            echo "passed=true" >> $GITHUB_OUTPUT
+          else
+            echo "passed=false" >> $GITHUB_OUTPUT
+          fi
+
+  promote-to-production:
+    needs: [get-model-version, validate-production-readiness, backup-current-production, deploy-canary]
+    if: needs.deploy-canary.outputs.canary_passed == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Download model
+        uses: actions/download-artifact@v4
+        with:
+          name: model-${{ needs.get-model-version.outputs.version }}
+          path: models/${{ needs.get-model-version.outputs.version }}/
+
+      - name: Promote to production
+        id: promote
+        run: |
+          python -m src.promotion.promote \
+            --config configs/promotion_config.yaml \
+            --model-path models/${{ needs.get-model-version.outputs.version }}/model.pkl \
+            --version ${{ needs.get-model-version.outputs.version }}
+
+      - name: Update production tag
+        run: |
+          git config user.email "ci@pipeline.com"
+          git config user.name "CI Pipeline"
+          git tag -a "production-${{ needs.get-model-version.outputs.version }}" -m "Production model ${{ needs.get-model-version.outputs.version }}"
+          git push origin "production-${{ needs.get-model-version.outputs.version }}"
+
+      - name: Log promotion to MLflow
+        env:
+          MLFLOW_TRACKING_URI: ${{ secrets.MLFLOW_TRACKING_URI }}
+        run: |
+          python -c "
+          import mlflow
+          mlflow.set_tracking_uri('${{ env.MLFLOW_TRACKING_URI }}')
+          with mlflow.start_run(run_name='production-promotion-${{ needs.get-model-version.outputs.version }}'):
+              mlflow.log_param('model_version', '${{ needs.get-model-version.outputs.version }}')
+              mlflow.log_param('promotion_status', 'success')
+              mlflow.log_param('promotion_timestamp', '$(date -u +%Y-%m-%dT%H:%M:%SZ)')
+          "
+
+  rollback-on-failure:
+    needs: [get-model-version, deploy-canary]
+    if: failure() || needs.deploy-canary.outputs.canary_passed == 'false'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Rollback canary
+        run: |
+          python -m src.promotion.rollback \
+            --config configs/promotion_config.yaml \
+            --version ${{ needs.get-model-version.outputs.version }}
+
+      - name: Notify rollback
+        run: |
+          echo "⚠️ Canary deployment failed for model ${{ needs.get-model-version.outputs.version }}"
+          echo "Automatic rollback initiated"
+
+  notify-promotion:
+    needs: [get-model-version, promote-to-production]
+    if: success()
+    runs-on: ubuntu-latest
+    steps:
+      - name: Notify promotion success
+        run: |
+          echo "🎉 Model ${{ needs.get-model-version.outputs.version }} promoted to production"
+          echo "Production endpoint updated"
+
+  notify-failure:
+    needs: [get-model-version, promote-to-production]
+    if: failure()
+    runs-on: ubuntu-latest
+    steps:
+      - name: Notify promotion failure
+        run: |
+          echo "❌ Promotion failed for model ${{ needs.get-model-version.outputs.version }}"
+          echo "Current production model unchanged"

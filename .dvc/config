@@ -1,0 +1,41 @@
+core:
+  autostage: true
+  remote: origin
+
+remote "origin"
+  url: https://github.com/KhalidKhan541/ML-CICD-Pipeline.git
+  access_key_id: $AWS_ACCESS_KEY_ID
+  secret_access_key: $AWS_SECRET_ACCESS_KEY
+
+remote "s3"
+  url: s3://ml-cicd-pipeline-data
+  access_key_id: $AWS_ACCESS_KEY_ID
+  secret_access_key: $AWS_SECRET_ACCESS_KEY
+  region: us-east-1
+
+remote "gcs"
+  url: gs://ml-cicd-pipeline-data
+  credentialpath: ~/.config/gcloud/application_default_credentials.json
+
+storage:
+  s3:
+    region: us-east-1
+    endpoint_url: https://s3.amazonaws.com
+
+metrics:
+  - metrics.json:
+      cache: false
+
+plots:
+  - plots:
+      cache: false
+
+params:
+  - params.yaml:
+      cache: false
+
+cache:
+  type: s3
+  url: s3://ml-cicd-pipeline-cache
+  access_key_id: $AWS_ACCESS_KEY_ID
+  secret_access_key: $AWS_SECRET_ACCESS_KEY

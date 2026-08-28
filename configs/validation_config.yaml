@@ -1,0 +1,43 @@
+# Validation Configuration
+# =======================
+
+# Data configuration
+data_path: "data/"
+target_column: "target"
+
+# Accuracy Gate Thresholds
+accuracy:
+  min_accuracy: 0.75
+  min_precision: 0.70
+  min_recall: 0.70
+  min_f1_score: 0.70
+  min_roc_auc: 0.75
+
+# Fairness Gate Configuration
+fairness:
+  protected_attributes:
+    - "gender"
+    - "ethnicity"
+    - "age_group"
+  max_disparity: 0.20
+  min_group_size: 50
+
+# Data Quality Gate
+data_quality:
+  max_null_ratio: 0.30
+  max_cardinality_ratio: 0.90
+  min_samples: 100
+  max_duplicates_ratio: 0.10
+  min_feature_variance: 0.01
+
+# Performance Gate
+performance:
+  max_latency_ms: 100
+  min_throughput_rps: 100
+  max_model_size_mb: 500
+  max_memory_mb: 1000
+
+# Statistical Tests
+statistical:
+  max_p_value: 0.05
+  min_effect_size: 0.1
